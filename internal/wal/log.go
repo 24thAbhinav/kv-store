@@ -8,11 +8,11 @@ import (
 )
 
 func createFileSync(file string) (*os.File, error) {
-	fp, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
+	fp, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	if err = syncDir(path.Base(file)); err != nil {
+	if err = syncDir(file); err != nil {
 		_ = fp.Close()
 		return nil, err
 	}

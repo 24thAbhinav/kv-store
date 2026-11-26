@@ -2,17 +2,47 @@ package kv
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"testing"
+
+	"kvstore/internal/wal"
 )
 
 func newStore(t *testing.T) *KV {
 	t.Helper()
 
+	t.Chdir(t.TempDir())
+
 	store := &KV{}
 	if err := store.Open(); err != nil {
 		t.Fatalf("Open() returned error: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	return store
+}
+
+func readLog(t *testing.T, path string) []wal.Entry {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q) returned error: %v", path, err)
+	}
+	defer f.Close()
+
+	var entries []wal.Entry
+	for {
+		var ent wal.Entry
+		err := ent.Decode(f)
+		if err == io.EOF {
+			return entries
+		}
+		if err != nil {
+			t.Fatalf("Decode() returned error: %v", err)
+		}
+		entries = append(entries, ent)
+	}
 }
 
 func TestGetMissingKey(t *testing.T) {
@@ -92,5 +122,78 @@ func TestDel(t *testing.T) {
 	}
 	if deleted {
 		t.Error("Del() = true on missing key, want false")
+	}
+}
+
+func TestSetWritesLogEntry(t *testing.T) {
+	store := newStore(t)
+
+	if _, err := store.Set([]byte("name"), []byte("abhinav")); err != nil {
+		t.Fatalf("Set() returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	entries := readLog(t, "store.wal")
+	if len(entries) != 1 {
+		t.Fatalf("log has %d entries, want 1", len(entries))
+	}
+
+	ent := entries[0]
+	if string(ent.Key) != "name" || string(ent.Val) != "abhinav" {
+		t.Errorf("entry = %s=%s, want name=abhinav", ent.Key, ent.Val)
+	}
+	if ent.Deleted {
+		t.Error("entry Deleted = true, want false")
+	}
+}
+
+func TestDelWritesTombstone(t *testing.T) {
+	store := newStore(t)
+
+	store.Set([]byte("name"), []byte("abhinav"))
+
+	if _, err := store.Del([]byte("name")); err != nil {
+		t.Fatalf("Del() returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	entries := readLog(t, "store.wal")
+	if len(entries) != 2 {
+		t.Fatalf("log has %d entries, want 2", len(entries))
+	}
+
+	tombstone := entries[1]
+	if !tombstone.Deleted {
+		t.Error("tombstone Deleted = false, want true")
+	}
+	if string(tombstone.Key) != "name" {
+		t.Errorf("tombstone key = %s, want name", tombstone.Key)
+	}
+	if len(tombstone.Val) != 0 {
+		t.Errorf("tombstone val = %v, want empty", tombstone.Val)
+	}
+}
+
+func TestDelMissingWritesNothing(t *testing.T) {
+	store := newStore(t)
+
+	deleted, err := store.Del([]byte("missing"))
+	if err != nil {
+		t.Fatalf("Del() returned error: %v", err)
+	}
+	if deleted {
+		t.Error("Del() = true on missing key, want false")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	entries := readLog(t, "store.wal")
+	if len(entries) != 0 {
+		t.Errorf("log has %d entries, want 0", len(entries))
 	}
 }

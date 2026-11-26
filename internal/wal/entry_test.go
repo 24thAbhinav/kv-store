@@ -2,44 +2,46 @@ package wal
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 )
 
+// name=John exactly as it appears on disk:
+// crc32 | keylen | vallen | deleted | key | val
+var johnRecord = []byte{
+	49, 52, 74, 199, // crc32 of the payload below
+	4, 0, 0, 0, // key length
+	4, 0, 0, 0, // value length
+	0, // not deleted
+	'n', 'a', 'm', 'e',
+	'J', 'o', 'h', 'n',
+}
+
+// name tombstone: crc32 | keylen | vallen | deleted | key
+var nameTombstone = []byte{
+	190, 164, 202, 141, // crc32 of the payload below
+	4, 0, 0, 0, // key length
+	0, 0, 0, 0, // value length
+	1, // deleted
+	'n', 'a', 'm', 'e',
+}
+
 func TestEntryEncode(t *testing.T) {
 	ent := Entry{
-		Key:     []byte("name"),
-		Val:     []byte("John"),
-		Deleted: false,
-	}
-	got := ent.Encode()
-
-	expected := []byte{
-		4, 0, 0, 0, // key length = 4 (little endian)
-		4, 0, 0, 0, // value length = 4
-		0,
-		'n', 'a', 'm', 'e',
-		'J', 'o', 'h', 'n',
+		Key: []byte("name"),
+		Val: []byte("John"),
 	}
 
-	if !bytes.Equal(got, expected) {
-		t.Fatalf("Encode() = %v, want %v", got, expected)
+	if got := ent.Encode(); !bytes.Equal(got, johnRecord) {
+		t.Fatalf("Encode() = %v, want %v", got, johnRecord)
 	}
 }
 
 func TestEntryDecode(t *testing.T) {
-	encoded := []byte{
-		4, 0, 0, 0,
-		4, 0, 0, 0,
-		0,
-		'n', 'a', 'm', 'e',
-		'J', 'o', 'h', 'n',
-	}
-
-	reader := bytes.NewReader(encoded)
-
 	var ent Entry
 
-	err := ent.Decode(reader)
+	err := ent.Decode(bytes.NewReader(johnRecord))
 	if err != nil {
 		t.Fatalf("Decode() returned error: %v", err)
 	}
@@ -53,7 +55,7 @@ func TestEntryDecode(t *testing.T) {
 	}
 
 	if ent.Deleted {
-		t.Error("deleted = true, want false")
+		t.Error("Deleted = true, want false")
 	}
 }
 
@@ -62,33 +64,16 @@ func TestEntryEncodeDeleted(t *testing.T) {
 		Key:     []byte("name"),
 		Deleted: true,
 	}
-	got := ent.Encode()
 
-	expected := []byte{
-		4, 0, 0, 0, // key length = 4 (little endian)
-		0, 0, 0, 0, // value length = 0
-		1, // deleted
-		'n', 'a', 'm', 'e',
-	}
-
-	if !bytes.Equal(got, expected) {
-		t.Fatalf("Encode() = %v, want %v", got, expected)
+	if got := ent.Encode(); !bytes.Equal(got, nameTombstone) {
+		t.Fatalf("Encode() = %v, want %v", got, nameTombstone)
 	}
 }
 
 func TestEntryDecodeDeleted(t *testing.T) {
-	encoded := []byte{
-		4, 0, 0, 0,
-		0, 0, 0, 0,
-		1,
-		'n', 'a', 'm', 'e',
-	}
-
-	reader := bytes.NewReader(encoded)
-
 	var ent Entry
 
-	err := ent.Decode(reader)
+	err := ent.Decode(bytes.NewReader(nameTombstone))
 	if err != nil {
 		t.Fatalf("Decode() returned error: %v", err)
 	}
@@ -102,40 +87,91 @@ func TestEntryDecodeDeleted(t *testing.T) {
 	}
 
 	if !ent.Deleted {
-		t.Error("deleted = false, want true")
+		t.Error("Deleted = false, want true")
 	}
 }
 
 func TestEntryRoundTrip(t *testing.T) {
 	original := Entry{
-		Key:     []byte("username"),
-		Val:     []byte("abhinav"),
-		Deleted: false,
+		Key: []byte("username"),
+		Val: []byte("abhinav"),
 	}
-
-	encoded := original.Encode()
 
 	var decoded Entry
 
-	reader := bytes.NewReader(encoded)
-
-	err := decoded.Decode(reader)
-	if err != nil {
+	if err := decoded.Decode(bytes.NewReader(original.Encode())); err != nil {
 		t.Fatalf("Decode() returned error: %v", err)
 	}
 
 	if !bytes.Equal(original.Key, decoded.Key) {
-		t.Errorf("key mismatch: got %s, want %s",
-			decoded.Key, original.Key)
+		t.Errorf("key mismatch: got %s, want %s", decoded.Key, original.Key)
 	}
 
 	if !bytes.Equal(original.Val, decoded.Val) {
-		t.Errorf("value mismatch: got %s, want %s",
-			decoded.Val, original.Val)
+		t.Errorf("val mismatch: got %s, want %s", decoded.Val, original.Val)
 	}
 
 	if original.Deleted != decoded.Deleted {
-		t.Errorf("Deleted mismatch: got %t, want %t",
-			decoded.Deleted, original.Deleted)
+		t.Errorf("Deleted mismatch: got %t, want %t", decoded.Deleted, original.Deleted)
+	}
+}
+
+func TestEntryRoundTripDeleted(t *testing.T) {
+	original := Entry{
+		Key:     []byte("goner"),
+		Deleted: true,
+	}
+
+	var decoded Entry
+
+	if err := decoded.Decode(bytes.NewReader(original.Encode())); err != nil {
+		t.Fatalf("Decode() returned error: %v", err)
+	}
+
+	if !bytes.Equal(original.Key, decoded.Key) {
+		t.Errorf("key = %s, want %s", decoded.Key, original.Key)
+	}
+
+	if len(decoded.Val) != 0 {
+		t.Errorf("val = %v, want empty", decoded.Val)
+	}
+
+	if !decoded.Deleted {
+		t.Error("Deleted = false, want true")
+	}
+}
+
+func TestEntryDecodeBadChecksum(t *testing.T) {
+	encoded := bytes.Clone(johnRecord)
+	encoded[0] ^= 0xff
+
+	var ent Entry
+
+	err := ent.Decode(bytes.NewReader(encoded))
+	if !errors.Is(err, ErrBadSum) {
+		t.Fatalf("Decode() error = %v, want %v", err, ErrBadSum)
+	}
+}
+
+func TestEntryDecodeCorruptPayload(t *testing.T) {
+	encoded := bytes.Clone(johnRecord)
+	encoded[len(encoded)-1] ^= 0xff
+
+	var ent Entry
+
+	err := ent.Decode(bytes.NewReader(encoded))
+	if !errors.Is(err, ErrBadSum) {
+		t.Fatalf("Decode() error = %v, want %v", err, ErrBadSum)
+	}
+}
+
+func TestEntryDecodeTruncated(t *testing.T) {
+	truncated := johnRecord[:len(johnRecord)-3]
+
+	var ent Entry
+
+	err := ent.Decode(bytes.NewReader(truncated))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Decode() error = %v, want %v", err, io.ErrUnexpectedEOF)
 	}
 }
